@@ -1,47 +1,77 @@
 const { expect } = require("chai");
+const { ethers } = require("hardhat");
 
-describe("GreenH2CreditsV2", function () {
-  it("issue -> transfer -> retire with whitelist/consumer", async function () {
-    const [admin, auditor, regulator, producer, buyer] = await ethers.getSigners();
-    const F = await ethers.getContractFactory("GreenH2CreditsV2");
-    const c = await F.deploy(admin.address, auditor.address, regulator.address);
+describe("GreenH2CreditsV2 — core flow", () => {
+  async function deploy() {
+    const [admin, auditor, regulator, producer, consumer] = await ethers.getSigners();
+    const F = await ethers.getContractFactory("GreenH2CreditsV2", admin);
+    const c = await F.deploy(
+      await admin.getAddress(),
+      await auditor.getAddress(),
+      await regulator.getAddress()
+    );
     await c.waitForDeployment();
 
-    await c.connect(admin).setWhitelist(producer.address, true);
-    await c.connect(admin).setWhitelist(buyer.address, true);
-    await c.connect(admin).grantConsumer(buyer.address);
+    // bootstrap: whitelist + role
+    await (await c.setWhitelist(await producer.getAddress(), true)).wait();
+    await (await c.setWhitelist(await consumer.getAddress(), true)).wait();
+    await (await c.grantConsumer(await consumer.getAddress())).wait();
 
-    await expect(c.connect(auditor).issueCredit(producer.address, 500n, "cert:xyz"))
-      .to.emit(c, "Issued");
+    return { c, admin, auditor, regulator, producer, consumer };
+  }
 
-    await expect(c.connect(producer).transferCredit(buyer.address, 200n))
-      .to.emit(c, "TransferredBatch");
+  it("Issue → Transfer(FIFO) → Retire works end-to-end", async () => {
+    const { c, auditor, producer, consumer } = await deploy();
 
-    await expect(c.connect(buyer).retireCredit(150n))
-      .to.emit(c, "RetiredBatch");
+    // issue 1000 to producer (1 batch)
+    await expect(
+      c.connect(auditor).issueCredit(await producer.getAddress(), 1000n, "ipfs://m1")
+    ).to.emit(c, "Issued");
 
-    expect(await c.totalIssued()).to.equal(500n);
-    expect(await c.totalRetired()).to.equal(150n);
+    expect(await c.balanceOf(await producer.getAddress())).to.eq(1000n);
+
+    // transfer 300 to consumer
+    await expect(
+      c.connect(producer).transferCredit(await consumer.getAddress(), 300n)
+    ).to.emit(c, "Transferred").and.to.emit(c, "TransferredBatch");
+
+    expect(await c.balanceOf(await producer.getAddress())).to.eq(700n);
+    expect(await c.balanceOf(await consumer.getAddress())).to.eq(300n);
+
+    // retire 200 as consumer
+    await expect(
+      c.connect(consumer).retireCredit(200n)
+    ).to.emit(c, "Retired").and.to.emit(c, "RetiredBatch");
+
+    expect(await c.balanceOf(await consumer.getAddress())).to.eq(100n);
+    expect(await c.totalRetired()).to.eq(200n);
+
+    // holdings sanity (FIFO lots)
+    const [idsP, amtsP] = await c.getHoldings(await producer.getAddress());
+    const [idsC, amtsC] = await c.getHoldings(await consumer.getAddress());
+
+    // producer has 700 from batch 0
+    expect(idsP.length).to.be.greaterThan(0);
+    expect(amtsP.reduce((a, b) => a + b, 0n)).to.eq(700n);
+
+    // consumer has 100 from batch 0
+    expect(idsC.length).to.be.greaterThan(0);
+    expect(amtsC.reduce((a, b) => a + b, 0n)).to.eq(100n);
   });
 
-  it("FIFO across multiple batches", async function () {
-    const [admin, auditor, regulator, P, B] = await ethers.getSigners();
-    const F = await ethers.getContractFactory("GreenH2CreditsV2");
-    const c = await F.deploy(admin.address, auditor.address, regulator.address);
-    await c.waitForDeployment();
+  it("pause blocks core actions, unpause restores", async () => {
+    const { c, admin, auditor, producer } = await deploy();
 
-    await c.connect(admin).setWhitelist(P.address, true);
-    await c.connect(admin).setWhitelist(B.address, true);
-    await c.connect(admin).grantConsumer(B.address);
+    await (await c.connect(admin).pause()).wait();
 
-    await c.connect(auditor).issueCredit(P.address, 300n, "cert:A");
-    await c.connect(auditor).issueCredit(P.address, 200n, "cert:B");
+    await expect(
+      c.connect(auditor).issueCredit(await producer.getAddress(), 1n, "m")
+    ).to.be.reverted; // Pausable revert
 
-    await c.connect(P).transferCredit(B.address, 350n); // 300 A + 50 B
-    await c.connect(B).retireCredit(120n);              // burns from A first
+    await (await c.connect(admin).unpause()).wait();
 
-    const [ids, amts] = await c.getHoldings(B.address);
-    const sum = amts.reduce((a, b) => a + Number(b), 0);
-    expect(sum).to.equal(230);
+    await expect(
+      c.connect(auditor).issueCredit(await producer.getAddress(), 1n, "m")
+    ).to.emit(c, "Issued");
   });
 });

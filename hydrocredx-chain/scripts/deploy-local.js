@@ -1,35 +1,52 @@
-const fs = require("node:fs");
+// scripts/deploy-local.js
+const fs = require("fs");
+const path = require("path");
+const hre = require("hardhat");
 
 async function main() {
-  const [admin, auditor, regulator, producer, buyer] = await ethers.getSigners();
-  const F = await ethers.getContractFactory("GreenH2CreditsV2");
-  const c = await F.deploy(admin.address, auditor.address, regulator.address);
-  await c.waitForDeployment();
-  const addr = await c.getAddress();
-  console.log("Deployed:", addr);
+  const { ethers, network } = hre;
+  console.log(`Network: ${network.name}`);
 
-  // Whitelist & roles
-  await (await c.setWhitelist(producer.address, true)).wait();
-  await (await c.setWhitelist(buyer.address, true)).wait();
-  await (await c.grantConsumer(buyer.address)).wait();
+  const [admin, auditor, regulator, producer, consumer] = await ethers.getSigners();
 
-  // Seed demo batches
-  await (await c.connect(auditor).issueCredit(producer.address, 300n, "cert:PLANT-JULY")).wait();
-  await (await c.connect(auditor).issueCredit(producer.address, 200n, "cert:PLANT-AUG")).wait();
-  await (await c.connect(producer).transferCredit(buyer.address, 150n)).wait();
+  console.log("Admin    :", await admin.getAddress());
+  console.log("Auditor  :", await auditor.getAddress());
+  console.log("Regulator:", await regulator.getAddress());
+  console.log("Producer :", await producer.getAddress());
+  console.log("Consumer :", await consumer.getAddress());
 
-  // Optional: save ABI/address for a future web app
-  try {
-    fs.mkdirSync("web/public", { recursive: true });
-    fs.writeFileSync(
-      "web/public/contract-address.json",
-      JSON.stringify({ address: addr, network: "localhost", time: Date.now() }, null, 2)
-    );
-    const artifactPath = "artifacts/contracts/GreenH2CreditsV2.sol/GreenH2CreditsV2.json";
-    const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
-    fs.mkdirSync("web/src/abi", { recursive: true });
-    fs.writeFileSync("web/src/abi/GreenH2CreditsV2.json", JSON.stringify(artifact.abi, null, 2));
-  } catch {}
+  const Factory = await ethers.getContractFactory("GreenH2CreditsV2", admin);
+  const contract = await Factory.deploy(
+    await admin.getAddress(),
+    await auditor.getAddress(),
+    await regulator.getAddress()
+  );
+  await contract.waitForDeployment();
+
+  const addr = await contract.getAddress();
+  console.log("Deployed GreenH2CreditsV2 at:", addr);
+  const outDir = path.join(__dirname, "..", "deployments", "localhost");
+fs.mkdirSync(outDir, { recursive: true });
+const outFile = path.join(outDir, "GreenH2CreditsV2.json");
+fs.writeFileSync(outFile, JSON.stringify({ address: addr }, null, 2));
+console.log("Saved:", outFile);
+  
+  // Quick sanity checks
+  console.log("isAuditor(auditor)?", await contract.isAuditor(await auditor.getAddress()));
+  console.log("isRegulator(reg)?", await contract.isRegulator(await regulator.getAddress()));
+  console.log("isConsumer(consumer)?", await contract.isConsumer(await consumer.getAddress()));
+
+  // whitelist a couple of accounts so transfers/issue will work immediately
+  await (await contract.setWhitelist(await producer.getAddress(), true)).wait();
+  await (await contract.setWhitelist(await consumer.getAddress(), true)).wait();
+
+  // grant CONSUMER to consumer
+  await (await contract.grantConsumer(await consumer.getAddress())).wait();
+
+  console.log("Bootstrap done.");
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
