@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getContract } from "./lib/eth";
+import { getContract, initializeTransactionMirroring } from "./lib/eth";
 import { AUDITOR_ROLE, REGULATOR_ROLE, CONSUMER_ROLE, PRODUCER_ROLE } from "./lib/roles";
 
 function Stat({ label, value }) {
@@ -24,6 +24,12 @@ export default function App() {
   const [networkMsg, setNetworkMsg] = useState("");
   const [myRoles, setMyRoles] = useState([]);
   const [activeRole, setActiveRole] = useState(""); // selected role
+  
+  // New state for transaction mirroring
+  const [supabaseService, setSupabaseService] = useState(null);
+  const [mirroredTransactions, setMirroredTransactions] = useState([]);
+  const [transactionStats, setTransactionStats] = useState({});
+  const [isMirroringEnabled, setIsMirroringEnabled] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -34,12 +40,44 @@ export default function App() {
         setMe(signerAddr);
         await refresh(contract, signerAddr);
         setNetworkMsg("Connected (use MetaMask: Localhost 8545, chainId 31337)");
+        
+        // Initialize transaction mirroring
+        try {
+          const { supabaseService: service } = await initializeTransactionMirroring();
+          setSupabaseService(service);
+          setIsMirroringEnabled(true);
+          await loadMirroredTransactions(service);
+          await loadTransactionStats(service);
+        } catch (mirrorError) {
+          console.warn('Transaction mirroring not available:', mirrorError.message);
+          setIsMirroringEnabled(false);
+        }
       } catch (e) {
         console.error(e);
         setNetworkMsg(e.message || String(e));
       }
     })();
   }, []);
+
+  async function loadMirroredTransactions(service) {
+    if (!service) return;
+    try {
+      const transactions = await service.getTransactions({ limit: 50 });
+      setMirroredTransactions(transactions);
+    } catch (error) {
+      console.error('Error loading mirrored transactions:', error);
+    }
+  }
+
+  async function loadTransactionStats(service) {
+    if (!service) return;
+    try {
+      const stats = await service.getTransactionStats();
+      setTransactionStats(stats);
+    } catch (error) {
+      console.error('Error loading transaction stats:', error);
+    }
+  }
 
   async function refresh(contract, addr) {
     const [ti, tr, bal, isAuditor, isRegulator, isConsumer, isProducer] =
@@ -213,7 +251,24 @@ export default function App() {
         <Stat label="My Balance" value={myBal} />
         <Stat label="Total Issued" value={totalIssued} />
         <Stat label="Total Retired" value={totalRetired} />
+        <Stat label="Mirroring Status" value={isMirroringEnabled ? "Active" : "Disabled"} />
       </div>
+
+      {/* Transaction Mirroring Status */}
+      {isMirroringEnabled && (
+        <div className="p-4 rounded-2xl border bg-green-50">
+          <h2 className="text-xl font-semibold mb-3 text-green-800">Transaction Mirroring Active</h2>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <Stat label="Total Transactions" value={transactionStats.totalTransactions || 0} />
+            <Stat label="Issued Events" value={transactionStats.eventCounts?.Issued || 0} />
+            <Stat label="Transfer Events" value={transactionStats.eventCounts?.Transferred || 0} />
+            <Stat label="Retired Events" value={transactionStats.eventCounts?.Retired || 0} />
+          </div>
+          <p className="text-sm text-green-600 mt-2">
+            All blockchain transactions are being mirrored to Supabase in real-time
+          </p>
+        </div>
+      )}
 
       <section className="p-4 rounded-2xl border">
         <h2 className="text-xl font-semibold mb-3">My Batch Holdings (FIFO lots)</h2>
@@ -371,6 +426,66 @@ export default function App() {
           </ul>
         </div>
       </section>
+
+      {/* Mirrored Transactions from Supabase */}
+      {isMirroringEnabled && (
+        <section className="p-4 rounded-2xl border">
+          <h2 className="text-xl font-semibold mb-3">Mirrored Transactions (Supabase Backup)</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left">
+                  <th className="py-2">Event</th>
+                  <th>From</th>
+                  <th>To</th>
+                  <th>Amount</th>
+                  <th>Batch ID</th>
+                  <th>Block</th>
+                  <th>Timestamp</th>
+                </tr>
+              </thead>
+              <tbody>
+                {mirroredTransactions.map((tx, i) => (
+                  <tr key={i} className="border-t">
+                    <td className="py-2">
+                      <span className={`px-2 py-1 rounded text-xs ${
+                        tx.event_name === 'Issued' ? 'bg-green-100 text-green-800' :
+                        tx.event_name === 'Transferred' ? 'bg-blue-100 text-blue-800' :
+                        tx.event_name === 'Retired' ? 'bg-red-100 text-red-800' :
+                        'bg-gray-100 text-gray-800'
+                      }`}>
+                        {tx.event_name}
+                      </span>
+                    </td>
+                    <td className="py-2">
+                      {tx.from_address ? `${tx.from_address.slice(0, 6)}…${tx.from_address.slice(-4)}` : '-'}
+                    </td>
+                    <td className="py-2">
+                      {tx.to_address ? `${tx.to_address.slice(0, 6)}…${tx.to_address.slice(-4)}` : '-'}
+                    </td>
+                    <td className="py-2">{tx.amount || '-'}</td>
+                    <td className="py-2">{tx.batch_id || '-'}</td>
+                    <td className="py-2">{tx.block_number}</td>
+                    <td className="py-2">
+                      {tx.block_timestamp ? new Date(tx.block_timestamp * 1000).toLocaleString() : '-'}
+                    </td>
+                  </tr>
+                ))}
+                {mirroredTransactions.length === 0 && (
+                  <tr>
+                    <td className="py-2 text-gray-500" colSpan={7}>
+                      No transactions mirrored yet
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-3 text-xs text-gray-500">
+            Showing last 50 transactions. All transactions are automatically mirrored from the blockchain to Supabase.
+          </div>
+        </section>
+      )}
     </div>
   );
 }
